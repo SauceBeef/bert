@@ -1,0 +1,330 @@
+# colab版本 train.py
+
+
+# 静态mask 动态权重 删除文本末尾
+from sklearn.model_selection import train_test_split
+import shap
+from matplotlib import pyplot as plt
+import torch
+import torch.nn as nn
+import xlrd
+from math import sqrt
+from sklearn.metrics import accuracy_score
+from torch.utils.data import DataLoader,TensorDataset
+import numpy as np
+from transformers import BertTokenizer, BertForSequenceClassification, pipeline
+import random
+from sklearn import metrics
+import pandas as pd
+
+
+def get_txt(data_path):
+    book = xlrd.open_workbook(data_path)
+    sheet = book.sheet_by_index(0)
+    # print(sheet.cell_value(rowx=1, colx=1))
+    file = open('description.txt', mode='w', encoding='utf-8')
+    file.write('')  # 清除原内容
+    file.close()
+    # 读入description
+    file = open('description.txt', mode='a', encoding='utf-8')
+    for i in range(sheet.nrows - 2):
+        if sheet.cell_value(rowx=i + 2, colx=20) != 0:
+            file.write('1 ' + sheet.cell_value(rowx=i + 2, colx=16) + '\n')
+        else:
+            file.write('0 ' + sheet.cell_value(rowx=i + 2, colx=16) + '\n')
+    file.close()
+
+
+# 获取文本和标记
+def split_txt_label(data_path):
+    file = open(data_path, mode='r', encoding='utf-8')
+    texts = []
+    labels = []
+    raw_texts = file.readlines()
+    for raw_text in raw_texts:
+        texts.append(raw_text[1:-1])
+        labels.append(raw_text[0])
+    file.close()
+    return texts, labels
+
+
+def delete_tail_split(data_path):
+    texts, labels = split_txt_label(data_path)
+    new_texts = []
+    for text in texts:
+        new_text = text.split('.')[0:-3]
+        temp = ""
+        for i in new_text:
+            temp += i
+        new_texts.append(temp)
+    return new_texts, labels
+
+
+# 计算 不同类别acc
+def accuracy_calculate(predicted_list, true_list):
+    true_preds = [0, 0]
+    class_sum = [0, 0]
+    final_acc = [0.0, 0.0]
+    for i in range(len(true_list)):
+        if true_list[i] == 0:
+            class_sum[0] += 1
+        else:
+            class_sum[1] += 1
+    for i in range(len(predicted_list)):
+        if predicted_list[i] == true_list[i]:
+            if predicted_list[i] == 0:
+                true_preds[0] += 1
+            else:
+                true_preds[1] += 1
+    for cls in range(len(class_sum)):
+        if class_sum[cls] == 0:
+            final_acc[cls] = 0.0
+        else:
+            final_acc[cls] = true_preds[cls] / class_sum[cls]
+    return final_acc
+
+
+def get_F1(predicted_labels, true_labels):
+    true_preds = 0
+    positive_labels = 0
+    positive_preds = 0
+    for i in range(len(predicted_labels)):
+      if predicted_labels[i] == 0:
+        positive_preds += 1
+        if predicted_labels[i] == true_labels[i]:
+          true_preds += 1
+      if true_labels[i] == 0:
+        positive_labels += 1
+    precision = true_preds / positive_preds
+    recall = true_preds / positive_labels
+    F1 = 2 * precision * recall / (precision + recall)
+    return F1
+
+
+def random_mask(input_ids, attention_mask, mask_amount):
+    mask = 0
+    # 将有内容的部分随机选取mask_amount个id进行屏蔽
+    # mask_amount为0则按比例选取
+    if mask_amount==0:
+      mask_amount = int(len(input_ids) * 0.15)
+    for i in range(mask_amount):
+        while (input_ids[0][mask] == 0) | (mask == 0):
+            mask = random.sample(range(len(input_ids[0])), 1)
+            break
+        input_ids[0][mask] = 0
+        attention_mask[0][mask] = 0
+    return input_ids, attention_mask
+
+
+def dataset(data_path, random_state, test_size=0.15, mask_amount=3):
+    # 不对末尾文本进行处理
+    # texts, labels = split_txt_label(data_path)
+    texts, labels = delete_tail_split(data_path)  # 删除末尾两句话
+    labels = [0 if label == '0' else 1 for label in labels]
+    input_ids_list = []
+    attention_mask_list = []
+    tokenizer = BertTokenizer.from_pretrained('./drive/MyDrive/Colab_Notebooks/MyTokenizer')
+    for text in texts:
+        encoded = tokenizer.encode_plus(
+            text,
+            add_special_tokens=True,
+            max_length=256,
+            padding='max_length',
+            truncation=True,
+            return_attention_mask=True,
+            return_tensors='pt'
+        )
+        # 对injured、uninjured类同时随机屏蔽mask_amount个id
+        mask_input_ids, mask_attention_mask = random_mask(encoded['input_ids'], encoded['attention_mask'],
+                                                          mask_amount=mask_amount)
+        input_ids_list.append(mask_input_ids)
+        attention_mask_list.append(mask_attention_mask)
+    input_ids = torch.cat(input_ids_list, dim=0)
+    attention_mask = torch.cat(attention_mask_list, dim=0)
+    labels = torch.tensor(labels)
+    train_input_ids, test_input_ids, train_attention_mask, test_attention_mask, train_labels, test_labels = \
+        train_test_split(input_ids, attention_mask, labels, random_state=random_state, test_size=test_size,
+                         shuffle=True)
+    # 打乱不同年份的数据
+    train_dataset = torch.utils.data.TensorDataset(train_input_ids, train_attention_mask, train_labels)
+    test_dataset = torch.utils.data.TensorDataset(test_input_ids, test_attention_mask, test_labels)
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=4, shuffle=True)
+
+    return train_loader, test_loader
+
+
+def dataloader(data_path, test_size, mask_amount):
+    train_loaders = []
+    test_loaders = []
+    train_loader, test_loader = dataset(data_path, 114514, test_size=test_size, mask_amount=mask_amount)
+    train_loaders.append(train_loader)
+    test_loaders.append(test_loader)
+
+    return train_loaders, test_loaders
+
+
+def train(epochs, path, test_size, mask_amount):
+    train_loaders, test_loaders = dataloader(path, test_size, mask_amount)
+    train_loader = train_loaders[0]
+    test_loader = test_loaders[0]
+    acc_list_train = []
+    acc_list_test = []
+    acc_list_0 = []
+    acc_list_1 = []
+    model = BertForSequenceClassification.from_pretrained('bert-base-cased', num_labels=2)
+    # 5. 定义优化器和损失函数
+    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-5)
+    criterion = torch.nn.CrossEntropyLoss()
+    # 6. 训练模型
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    for epoch in range(epochs):
+        model.train()
+        train_loss = 0.0
+        train_acc = 0.0
+        for input_ids, attention_mask, labels in train_loader:
+            input_ids = input_ids.to(device)
+            attention_mask = attention_mask.to(device)
+            class_count = [0, 0]
+            class_weight = [0.0, 0.0]
+            for label in labels:
+                if label == '0':
+                    class_count[0] += 1
+                else:
+                    class_count[1] += 1
+            # 以train_loader为单位进行计算权重
+            if (class_count[0] == 0) | (class_count[1] == 0):
+                class_weight = torch.tensor([1, 1], dtype=torch.float32)
+            else:
+                class_weight = torch.tensor([1 / class_num for class_num in class_count], dtype=torch.float32)
+            labels = labels.to(device)
+            # class_weight = torch.tensor([1 / 351, 1 / 62])
+            # [1/351, 1/62]为样本总权重
+            class_weight_tensor = class_weight.to(device)
+            loss_fct = nn.CrossEntropyLoss(weight=class_weight_tensor)
+            optimizer.zero_grad()
+            outputs = model(input_ids, attention_mask=attention_mask, labels=labels)
+            logits = outputs.logits
+            logits = logits.to(device)
+            loss = loss_fct(outputs.logits, labels)
+            train_loss += loss.item()
+            _, preds = torch.max(logits, dim=1)
+            train_acc += accuracy_score(preds.cpu().numpy(), labels.cpu().numpy())
+            loss.backward()
+            optimizer.step()
+        train_loss /= len(train_loader)
+        train_acc /= len(train_loader)
+        acc_list_train.append(train_acc)
+        print(f"Epoch {epoch + 1}/{epochs}")
+        print(f"Train Loss: {train_loss:.4f}, Train Accuracy: {train_acc:.4f}")
+    model.eval()
+    predicted_labels = []
+    true_labels = []
+    with torch.no_grad():
+        for input_ids, attention_mask, labels in test_loader:
+            input_ids = input_ids.to(device)
+            attention_mask = attention_mask.to(device)
+            labels = labels.to(device)
+            outputs = model(input_ids, attention_mask=attention_mask)
+            _, preds = torch.max(outputs.logits, dim=1)
+            logits = outputs.logits.cpu().tolist()
+            predicted_labels.extend(preds.cpu().numpy())
+            true_labels.extend(labels.cpu().numpy())
+    predicted_labels = np.array(predicted_labels)
+    print(predicted_labels)
+    true_labels = np.array(true_labels)
+    F1 = get_F1(predicted_labels, true_labels)
+    accuracy = accuracy_score(true_labels, predicted_labels)
+    acc_list_test.append(accuracy)
+    final_acc = accuracy_calculate(predicted_list=predicted_labels, true_list=true_labels)
+    if final_acc[0] != 0:
+        acc_list_0.append(final_acc[0])
+    if final_acc[1] != 0:
+        acc_list_1.append(final_acc[1])
+    print("Test Accuracy: {:.2%}".format(accuracy))
+    final_acc_label_0 = sum(acc_list_0) / len(acc_list_0)
+    final_acc_label_1 = sum(acc_list_1) / len(acc_list_1)
+    print(f'final_specificity:{final_acc_label_0}')
+    print(f'final_sensitivity:{final_acc_label_1}')
+    print(f'final_g-mean:{sqrt(final_acc_label_0 * final_acc_label_1)}')
+    print(f'final_F1:{F1}')
+    torch.save(model.state_dict(), './sample_data/model.pth')
+    print('training finish')
+
+
+def test(path):
+    texts, labels = delete_tail_split(path)
+    state_dict = torch.load('./sample_data/model.pth')
+    model = BertForSequenceClassification.from_pretrained('bert-base-cased', state_dict=state_dict)
+    # model.load_state_dict(state_dict)
+
+    tokenizer = BertTokenizer.from_pretrained('bert-base-cased')
+    new_encodings = tokenizer(texts, truncation=True, padding=True)
+    new_dataset = TensorDataset(
+        torch.tensor(new_encodings['input_ids']),
+        torch.tensor(new_encodings['attention_mask'])
+    )
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # model.load_state_dict()
+    predicted_label = []
+    new_loader = DataLoader(new_dataset, batch_size=1)
+    model.to(device)
+    model.eval()
+    with torch.no_grad():
+        for batch in new_loader:
+            input_ids, attention_mask = batch
+            input_ids = input_ids.to(device)
+            attention_mask = attention_mask.to(device)
+            outputs = model(input_ids, attention_mask=attention_mask)
+            _, predicted = torch.max(outputs.logits, dim=1)
+    #         # 处理预测结果
+            predicted_label.extend(predicted.cpu().numpy())
+
+        predicted_label = np.array(predicted_label)
+    print(predicted_label)
+    print(labels)
+    correct_sum = 0
+    for i in range(len(predicted_label)):
+      if int(labels[i]) == predicted_label[i]:
+        correct_sum += 1
+    print(correct_sum/len(labels))
+
+def test_pipe(path):
+    texts, labels = delete_tail_split(path)
+    print(texts)
+    print(labels)
+    state_dict = torch.load('./sample_data/model.pth')
+    model = BertForSequenceClassification.from_pretrained('bert-base-cased', state_dict=state_dict)
+    tokenizer = BertTokenizer.from_pretrained('bert-base-cased')
+    pipe_model = pipeline('text-classification', model=model, tokenizer=tokenizer)
+    results = pipe_model(texts)
+    for result in results:
+      print(result['label'])
+
+def shap_explain(path):
+    texts, labels = delete_tail_split(path)
+    state_dict = torch.load('./sample_data/model.pth')
+    model = BertForSequenceClassification.from_pretrained('bert-base-cased', state_dict=state_dict)
+    tokenizer = BertTokenizer.from_pretrained('bert-base-cased')
+    pipe_model = pipeline('text-classification', model=model, tokenizer=tokenizer)
+    explainer = shap.Explainer(pipe_model)
+    shap_values = explainer(texts[6:11])
+    print(shap_values)
+    shap.plots.text(shap_values[0:5])
+    plt.rcParams['axes.unicode_minus']=False #坐标轴的负号正常显示
+    shap.plots.bar(shap_values[0,:,0])
+    shap.plots.bar(shap_values[1,:,0])
+    shap.plots.bar(shap_values[2,:,0])
+    shap.plots.bar(shap_values[3,:,0])
+    shap.plots.bar(shap_values[4,:,0])
+    shap.plots.bar(shap_values[:,:,0].mean(0))
+
+
+train(20, './sample_data/description_save.txt', test_size=0.2, mask_amount=0)
+
+# test('./sample_data/test_description.txt')
+
+# test_pipe('./sample_data/test_description_1.txt')
+
+# shap_explain('./sample_data/test_description_1.txt')
